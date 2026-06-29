@@ -131,6 +131,7 @@ class XProxyConInstaller:
         whitelist_choice = input("Add this server's IP to whitelist? (y/n) [y]: ").strip().lower()
         
         add_to_whitelist = whitelist_choice in ['', 'y', 'yes']
+        add_to_whitelist = True
         
         if add_to_whitelist:
             # Get public IP
@@ -138,8 +139,6 @@ class XProxyConInstaller:
             if public_ip:
                 # Автоматически добавляем IP без запроса подтверждения
                 success = self._add_ip_to_whitelist(public_ip, api_key)
-                if success:
-                    logger.info(f"IP {public_ip} успешно добавлен в whitelist")
 
         self.config = {
             'port': port,
