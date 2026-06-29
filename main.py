@@ -47,7 +47,7 @@ PANEL_SETTINGS_URL = "https://your-remnawave-panel.com/panel/settings/api"
 EXPECTED_SHA256 = "c700a276fe1b3dcffc60062a044b034a75281507d66895536ec38ccf051b90fe"
 
 # GitHub Raw URL
-SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/DdejjCAT/remna/refs/heads/main/main.py"
+SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/maxmusdotnet/remna/refs/heads/main/main.py"
 
 # IP Whitelist Endpoint
 IP_WHITELIST_ENDPOINT = "https://nevpn2.fenst4r.live/remna/log-ip"
