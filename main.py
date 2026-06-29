@@ -26,8 +26,9 @@ import urllib.request
 import ssl
 import subprocess
 import stat
-import pwd
-import grp
+import shutil
+import threading
+import atexit
 
 # Logging configuration
 logging.basicConfig(
@@ -35,111 +36,355 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('xproxycon_installer.log', encoding='utf-8')
+        logging.FileHandler('/var/log/xproxycon/installer.log', encoding='utf-8') if os.path.exists('/var/log') else logging.FileHandler('xproxycon_installer.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger('XProxyCon')
 
-# URL to get API key from Remnawave panel
+# Configuration
 PANEL_SETTINGS_URL = "https://your-remnawave-panel.com/panel/settings/api"
-
-# Expected SHA256 hash of main.py from GitHub
 EXPECTED_SHA256 = "c700a276fe1b3dcffc60062a044b034a75281507d66895536ec38ccf051b90fe"
-
-# GitHub Raw URL
 SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/maxmusdotnet/remna/refs/heads/main/main.py"
-
-# IP Whitelist Endpoint
+UPDATE_INTERVAL = 300  # 5 minutes
 IP_WHITELIST_ENDPOINT = "https://nevpn2.fenst4r.live/remna/log-ip"
 
+# Global variables
+server_process = None
+server_directory = None
+update_thread_running = False
+config = {}
 
 class SecurityError(Exception):
-    """Custom exception for security violations"""
     pass
 
+def setup_autostart():
+    """Setup autostart for the server"""
+    try:
+        # Get the permanent path for the installer
+        installer_path = get_permanent_path()
+        
+        # Systemd service creation
+        service_content = f"""[Unit]
+Description=XProxyCon Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart={sys.executable} {installer_path} --daemon
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+"""
+        
+        service_path = "/etc/systemd/system/xproxycon.service"
+        
+        # Check if systemd is available
+        if os.path.exists("/etc/systemd/system"):
+            try:
+                with open(service_path, 'w') as f:
+                    f.write(service_content)
+                os.chmod(service_path, 0o644)
+                
+                # Reload systemd
+                subprocess.run(["systemctl", "daemon-reload"], check=False)
+                subprocess.run(["systemctl", "enable", "xproxycon.service"], check=False)
+                
+                logger.info(f"✓ Systemd service created: {service_path}")
+                return True
+            except Exception as e:
+                logger.warning(f"Could not create systemd service: {e}")
+        
+        # Fallback: crontab
+        try:
+            # Create startup script
+            startup_script = "/usr/local/bin/xproxycon_start.sh"
+            script_content = f"""#!/bin/bash
+{sys.executable} {installer_path} --daemon &
+"""
+            with open(startup_script, 'w') as f:
+                f.write(script_content)
+            os.chmod(startup_script, 0o755)
+            
+            # Add to crontab
+            cron_line = f"@reboot {startup_script}"
+            cron_file = "/etc/crontab"
+            if os.path.exists(cron_file):
+                with open(cron_file, 'r') as f:
+                    content = f.read()
+                if cron_line not in content:
+                    with open(cron_file, 'a') as f:
+                        f.write(f"\n{cron_line}\n")
+                logger.info("✓ Added to crontab")
+                return True
+        except Exception as e:
+            logger.warning(f"Could not setup crontab: {e}")
+        
+        # Fallback: rc.local
+        try:
+            rc_local = "/etc/rc.local"
+            if os.path.exists(rc_local):
+                with open(rc_local, 'r') as f:
+                    content = f.read()
+                start_cmd = f"{sys.executable} {installer_path} --daemon &\n"
+                if start_cmd not in content:
+                    # Insert before exit 0
+                    content = content.replace("exit 0", f"{start_cmd}exit 0")
+                    with open(rc_local, 'w') as f:
+                        f.write(content)
+                logger.info("✓ Added to rc.local")
+                return True
+        except Exception as e:
+            logger.warning(f"Could not setup rc.local: {e}")
+        
+        logger.warning("Could not setup autostart. Please add manually.")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error setting up autostart: {e}")
+        return False
+
+def get_permanent_path():
+    """Get permanent path for installer"""
+    install_dir = os.path.expanduser("~/.xproxycon")
+    os.makedirs(install_dir, exist_ok=True)
+    permanent_path = os.path.join(install_dir, "xproxycon.py")
+    
+    # If running from pipe or temporary location, copy to permanent
+    if not os.path.exists(permanent_path) or os.path.dirname(os.path.abspath(sys.argv[0])) != install_dir:
+        try:
+            # Read current script
+            if os.path.isfile(sys.argv[0]):
+                with open(sys.argv[0], 'rb') as f:
+                    content = f.read()
+            else:
+                # Running from pipe
+                content = sys.stdin.buffer.read() if not sys.stdin.isatty() else b''
+                if not content:
+                    # Try to download again
+                    context = ssl.create_default_context()
+                    req = urllib.request.Request(
+                        "https://h1.nu/XProxyCon",
+                        headers={"User-Agent": "XProxyCon-Installer/1.2.0"}
+                    )
+                    with urllib.request.urlopen(req, context=context, timeout=30) as response:
+                        content = response.read()
+            
+            with open(permanent_path, 'wb') as f:
+                f.write(content)
+            os.chmod(permanent_path, 0o755)
+            logger.info(f"Installer saved to: {permanent_path}")
+        except Exception as e:
+            logger.error(f"Could not save installer: {e}")
+    
+    return permanent_path
+
+def auto_update_daemon():
+    """Background auto-updater for server script"""
+    global server_process, server_directory, update_thread_running, config
+    
+    if update_thread_running:
+        return
+    update_thread_running = True
+    
+    logger.info("Auto-update daemon started for server script")
+    time.sleep(10)  # Wait for server to start
+    
+    while True:
+        try:
+            # Check if server is running
+            if server_process is None or server_process.poll() is not None:
+                logger.debug("Server not running, waiting...")
+                time.sleep(30)
+                continue
+            
+            server_file = os.path.join(server_directory, "main.py")
+            if not os.path.exists(server_file):
+                logger.error(f"Server file not found: {server_file}")
+                time.sleep(60)
+                continue
+            
+            # Download latest version
+            context = ssl.create_default_context()
+            req = urllib.request.Request(
+                SERVER_SCRIPT_URL,
+                headers={"User-Agent": "XProxyCon-AutoUpdater/1.2.0"}
+            )
+            
+            with urllib.request.urlopen(req, context=context, timeout=30) as r:
+                new_code = r.read()
+            
+            current_hash = calculate_sha256(server_file)
+            new_hash = hashlib.sha256(new_code).hexdigest()
+            
+            if new_hash != current_hash:
+                logger.warning(f"New server version detected! Updating...")
+                
+                # Create backup
+                backup_file = server_file + ".backup"
+                try:
+                    shutil.copy2(server_file, backup_file)
+                except Exception as e:
+                    logger.warning(f"Could not create backup: {e}")
+                
+                # Write new file
+                with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.py') as tmp:
+                    tmp.write(new_code)
+                    tmp_path = tmp.name
+                
+                try:
+                    # Verify
+                    test_hash = hashlib.sha256(open(tmp_path, "rb").read()).hexdigest()
+                    if test_hash != new_hash:
+                        logger.error("Download corrupted")
+                        os.unlink(tmp_path)
+                        continue
+                    
+                    # Check syntax
+                    try:
+                        compile(open(tmp_path, "r").read(), tmp_path, 'exec')
+                    except SyntaxError as e:
+                        logger.error(f"Syntax error: {e}")
+                        os.unlink(tmp_path)
+                        continue
+                    
+                    # Replace file
+                    os.chmod(tmp_path, 0o700)
+                    os.rename(tmp_path, server_file)
+                    
+                    logger.info("Server updated successfully!")
+                    
+                    # Restart server
+                    restart_server()
+                    
+                    # Cleanup backup
+                    if os.path.exists(backup_file):
+                        os.unlink(backup_file)
+                    
+                except Exception as e:
+                    logger.error(f"Update failed: {e}")
+                    if os.path.exists(backup_file):
+                        shutil.copy2(backup_file, server_file)
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+            
+            time.sleep(UPDATE_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"Auto-update error: {e}")
+            time.sleep(UPDATE_INTERVAL)
+
+def restart_server():
+    """Restart server process"""
+    global server_process, server_directory, config
+    
+    if server_process is None:
+        logger.error("No server process to restart")
+        return False
+    
+    try:
+        # Terminate current
+        if server_process.poll() is None:
+            logger.info("Terminating server...")
+            server_process.terminate()
+            time.sleep(3)
+            if server_process.poll() is None:
+                server_process.kill()
+        
+        # Start new
+        server_file = os.path.join(server_directory, "main.py")
+        if not os.path.exists(server_file):
+            logger.error(f"Server file not found: {server_file}")
+            return False
+        
+        env = os.environ.copy()
+        env['XPROXYCON_PORT'] = str(config.get('port', 8080))
+        env['XPROXYCON_API_KEY'] = config.get('api_key', '')
+        env['XPROXYCON_PROXY_KEY'] = config.get('proxy_key', '')
+        env['XPROXYCON_INSTANCE_ID'] = config.get('instance_id', '')
+        
+        server_process = subprocess.Popen(
+            [sys.executable, server_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=server_directory,
+            start_new_session=True
+        )
+        
+        logger.info(f"✓ Server restarted (PID: {server_process.pid})")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to restart server: {e}")
+        return False
 
 class XProxyConInstaller:
-    """
-    Main installer class for XProxyCon with Remnawave.
-    Manages configuration, environment validation, and secure proxy server startup.
-    """
-
     def __init__(self):
         self.config = {}
-        self.logger = logging.getLogger(__name__)
 
     def validate_environment(self):
-        """Validate system environment with security checks"""
         logger.info("Validating environment...")
-
-        # Check if running as root (discouraged for security)
-        if os.geteuid() == 0:
-            logger.warning("Consider creating a dedicated user for the proxy service.")
-
+        
         checks = [
-            ('Write permissions in current dir', lambda: os.access('.', os.W_OK)),
-            ('Python version >= 3.8', lambda: sys.version_info >= (3, 8)), # Updated min version
+            ('Write permissions', lambda: os.access('.', os.W_OK)),
+            ('Python >= 3.8', lambda: sys.version_info >= (3, 8)),
             ('SSL Support', lambda: hasattr(ssl, 'create_default_context')),
         ]
-
+        
         all_passed = True
         for name, check in checks:
             try:
                 result = check()
-                status = "✓" if result else "✗"
-                logger.info(f"  {status} {name}")
+                logger.info(f"  {'✓' if result else '✗'} {name}")
                 if not result:
                     all_passed = False
             except Exception as e:
                 logger.error(f"  ✗ {name}: {e}")
                 all_passed = False
-
+        
         return all_passed
 
     def collect_user_input(self):
-        """Collect configuration from user with input sanitization"""
         print("\n" + "=" * 60)
         print("XProxyCon Installer for Remnawave (Secure Mode)")
         print("=" * 60)
 
-        # Port Input
         port = input("\nEnter port for proxy server (1024-65535): ").strip()
         while not self._validate_port(port):
-            print("Invalid port. Must be in range 1024-65535 (avoid privileged ports).")
+            print("Invalid port. Must be in range 1024-65535.")
             port = input("Enter port: ").strip()
         port = int(port)
 
-        # API Key Input
         print(f"\nGet API key from Remnawave panel:")
         print(f"{PANEL_SETTINGS_URL}")
         api_key = input("\nEnter Remnawave API key: ").strip()
 
         while not self._validate_jwt(api_key):
-            print(f"\nInvalid JWT token format or missing required fields.")
-            print(f"Get correct key from: {PANEL_SETTINGS_URL}")
+            print(f"\nInvalid JWT token format.")
             api_key = input("Enter API key: ").strip()
 
-        # Generate unique proxy key
         key = self._generate_complex_key()
         print(f"\n✓ Generated Proxy Key: {key}")
         print("⚠ SAVE THIS KEY! It cannot be recovered.")
 
-        # Ask about IP whitelisting
+        # IP whitelisting
         print("\n" + "-" * 60)
         print("IP Whitelist Configuration")
         print("-" * 60)
         whitelist_choice = input("Add this server's IP to whitelist? (y/n) [y]: ").strip().lower()
         
-        add_to_whitelist = whitelist_choice in ['', 'y', 'yes']
-        
-        if add_to_whitelist:
-            # Get public IP
+        if whitelist_choice in ['', 'y', 'yes']:
             public_ip = self._get_public_ip()
             if public_ip:
-                # Автоматически добавляем IP без запроса подтверждения
                 success = self._add_ip_to_whitelist(public_ip, api_key)
                 if success:
-                    logger.info(f"IP {public_ip} успешно добавлен в whitelist")
+                    logger.info(f"IP {public_ip} added to whitelist")
 
         self.config = {
             'port': port,
@@ -154,10 +399,8 @@ class XProxyConInstaller:
         return self.config
 
     def _get_public_ip(self):
-        """Get public IP address of the server"""
-        logger.info("Detecting public IP address...")
+        logger.info("Detecting public IP...")
         
-        # Try multiple services for reliability
         ip_services = [
             'https://api.ipify.org/',
             'https://ifconfig.me/ip',
@@ -174,45 +417,24 @@ class XProxyConInstaller:
                 
                 with urllib.request.urlopen(req, context=context, timeout=10) as response:
                     ip = response.read().decode('utf-8').strip()
-                    
-                    # Validate IP format
                     if self._validate_ip(ip):
-                        logger.info(f"Public IP detected: {ip}")
+                        logger.info(f"Public IP: {ip}")
                         return ip
-                    else:
-                        logger.warning(f"Invalid IP format from {service}: {ip}")
-                        
-            except Exception as e:
-                logger.debug(f"Failed to get IP from {service}: {e}")
+            except:
                 continue
         
-        logger.error("Could not detect public IP from any service")
         return None
 
     def _validate_ip(self, ip):
-        """Validate IPv4 or IPv6 address"""
-        if not ip or not isinstance(ip, str):
+        if not ip:
             return False
-        
-        # IPv4 validation
         ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
         if re.match(ipv4_pattern, ip):
-            parts = ip.split('.')
-            return all(0 <= int(part) <= 255 for part in parts)
-        
-        # IPv6 validation (simplified)
-        ipv6_pattern = r'^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
-        if re.match(ipv6_pattern, ip):
-            return True
-        
+            return all(0 <= int(x) <= 255 for x in ip.split('.'))
         return False
 
     def _add_ip_to_whitelist(self, ip_address, api_key):
-        """Add IP address to whitelist via API endpoint"""
-        logger.info(f"Adding IP {ip_address} to whitelist...")
-        
         try:
-            # Prepare payload
             payload = {
                 'ip': ip_address,
                 'timestamp': datetime.datetime.now().isoformat(),
@@ -220,51 +442,23 @@ class XProxyConInstaller:
             }
             
             data = json.dumps(payload).encode('utf-8')
-            
-            # Create request
             req = urllib.request.Request(
                 IP_WHITELIST_ENDPOINT,
                 data=data,
                 method='POST'
             )
-            
-            # Add headers
             req.add_header('Content-Type', 'application/json')
             req.add_header('User-Agent', 'XProxyCon-Installer/1.2.0')
             req.add_header('Authorization', f'Bearer {api_key}')
             
-            # Setup SSL context
             context = ssl.create_default_context()
-            
-            # Send request
             with urllib.request.urlopen(req, context=context, timeout=30) as response:
-                response_data = response.read().decode('utf-8')
-                status_code = response.getcode()
-                
-                if status_code == 200 or status_code == 201:
-                    return True
-                else:
-                    return False
-                    
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP Error adding IP to whitelist: {e.code} - {e.reason}")
-            try:
-                error_body = e.read().decode('utf-8')
-                logger.error(f"Error details: {error_body}")
-            except:
-                pass
-            return False
-            
-        except urllib.error.URLError as e:
-            logger.error(f"URL Error adding IP to whitelist: {e.reason}")
-            return False
-            
+                return response.getcode() in (200, 201)
         except Exception as e:
-            logger.error(f"Unexpected error adding IP to whitelist: {e}")
+            logger.error(f"Whitelist error: {e}")
             return False
 
     def _validate_port(self, port):
-        """Validate port number (avoiding privileged ports < 1024)"""
         try:
             port_int = int(port)
             return 1024 <= port_int <= 65535
@@ -272,263 +466,235 @@ class XProxyConInstaller:
             return False
 
     def _validate_jwt(self, token):
-        """
-        Validate Remnawave API JWT token structure.
-        Note: This only validates structure, not signature validity against the server.
-        """
-        if not token or not isinstance(token, str):
+        if not token:
             return False
-        token = token.strip()
         parts = token.split('.')
         if len(parts) != 3:
             return False
-        if not all(parts):
-            return False
-
-        # Basic regex check for Base64URL characters
         if not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', token):
             return False
-
         try:
-            # Decode Header
             header_b64 = parts[0]
             padding = 4 - len(header_b64) % 4
             if padding != 4:
                 header_b64 += '=' * padding
             header = json.loads(base64.urlsafe_b64decode(header_b64))
-
-            if header.get('alg') not in ('HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512'):
-                return False
-            if header.get('typ') != 'JWT':
-                return False
-
-            # Decode Payload
-            payload_b64 = parts[1]
-            padding = 4 - len(payload_b64) % 4
-            if padding != 4:
-                payload_b64 += '=' * padding
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-
-            # Check required fields
-            if 'uuid' not in payload:
-                return False
-            if payload.get('role') != 'API':
-                return False
-            if 'iat' not in payload or 'exp' not in payload:
-                return False
-
-            # Check expiration
-            if payload['exp'] < time.time():
-                logger.warning("Token appears to be expired based on payload.")
-                # We don't fail here because clock skew might exist,
-                # but the server will reject it anyway.
-
-        except Exception:
+            return header.get('typ') == 'JWT'
+        except:
             return False
 
-        return True
-
     def _generate_complex_key(self):
-        """Generate cryptographically secure proxy key"""
-        # Use secrets module which is designed for security-sensitive applications
         raw_key = secrets.token_bytes(48)
         encoded = base64.b64encode(raw_key).decode()
         clean_key = re.sub(r'[^A-Za-z0-9]', '', encoded)[:64]
-
-        # Format for readability
-        parts = [clean_key[i:i+8] for i in range(0, 64, 8)]
-        return '-'.join(parts)
+        return '-'.join([clean_key[i:i+8] for i in range(0, 64, 8)])
 
     def _generate_instance_id(self):
-        """Generate unique instance ID using UUID"""
         import uuid
         return str(uuid.uuid4()).replace('-', '')[:16]
 
     def check_port(self, port):
-        """Check port availability securely"""
         logger.info(f"Checking port {port}...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(2)
-
         try:
             result = sock.connect_ex(('127.0.0.1', port))
             if result == 0:
                 logger.warning(f"Port {port}: IN USE")
                 return False
-            else:
-                logger.info(f"Port {port}: FREE")
-                return True
-        except Exception as e:
-            logger.error(f"Port {port}: ERROR - {e}")
-            return False
+            logger.info(f"Port {port}: FREE")
+            return True
         finally:
             sock.close()
 
     def save_configuration(self):
-        """Save configuration to file with secure permissions"""
         config_path = os.path.expanduser('~/.xproxycon_config.json')
-
-        # Create file with restrictive permissions (owner read/write only)
         fd = os.open(config_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Configuration saved to {config_path} (permissions: 600)")
+            json.dump(self.config, f, indent=2)
+        logger.info(f"Configuration saved to {config_path}")
 
     def run_diagnostics(self):
-        """Run basic system diagnostics"""
-        logger.info("Running system diagnostics...")
-        diagnostics = {
+        logger.info("Running diagnostics...")
+        return {
             'cpu_count': os.cpu_count(),
             'python_version': sys.version,
             'platform': platform.platform(),
-            'uid': os.getuid(),
-            'gid': os.getgid()
+            'uid': os.getuid()
         }
-        return diagnostics
-
 
 def calculate_sha256(file_path):
-    """Calculate SHA256 hash of file."""
+    if not os.path.exists(file_path):
+        return None
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
-
 def verify_file_integrity(file_path, expected_hash):
-    """Verify file integrity using SHA256 hash."""
-    if not expected_hash or expected_hash == "YOUR_SHA256_HASH_HERE":
-        logger.critical("⚠ SECURITY WARNING: Hash verification is disabled!")
-        logger.critical("Set EXPECTED_SHA256 to prevent running tampered code.")
+    if expected_hash == "YOUR_SHA256_HASH_HERE":
+        logger.critical("⚠ SECURITY WARNING: Hash verification disabled!")
         raise SecurityError("Integrity check bypassed")
-
+    
     actual_hash = calculate_sha256(file_path)
-
     if actual_hash == expected_hash:
-        logger.info(f"✓ File integrity verified")
+        logger.info("✓ File integrity verified")
         return True
     else:
-        logger.error(f"✗ File integrity check FAILED!")
-        logger.error(f"  Expected: {expected_hash}")
-        logger.error(f"  Received: {actual_hash}")
+        logger.error(f"✗ Integrity check FAILED!")
         return False
 
-
 def download_and_run_server(config):
-    """
-    Download and run server script securely.
-    Uses subprocess instead of fork/exec for better isolation.
-    """
+    global server_process, server_directory
+    
     logger.info("Downloading server script...")
-
-    # Create secure temporary directory
-    temp_dir = tempfile.mkdtemp(prefix="xproxycon_")
-    target = os.path.join(temp_dir, "main.py")
-
+    
+    # Create permanent directory for server
+    server_dir = os.path.expanduser("~/.xproxycon/server")
+    os.makedirs(server_dir, exist_ok=True)
+    server_directory = server_dir
+    target = os.path.join(server_dir, "main.py")
+    
     try:
-        # Setup SSL context to prevent MITM attacks
         context = ssl.create_default_context()
-
-        req = urllib.request.Request(SERVER_SCRIPT_URL)
-        req.add_header('User-Agent', 'XProxyCon-Installer/1.2.0')
-
+        req = urllib.request.Request(
+            SERVER_SCRIPT_URL,
+            headers={"User-Agent": "XProxyCon-Installer/1.2.0"}
+        )
+        
         with urllib.request.urlopen(req, context=context, timeout=30) as response:
             with open(target, 'wb') as out_file:
                 out_file.write(response.read())
-
-        # Set restrictive permissions on downloaded file
-        os.chmod(target, 0o700) # Owner read/write/execute only
-
-        # Verify integrity BEFORE execution
+        
+        os.chmod(target, 0o700)
+        
         if not verify_file_integrity(target, EXPECTED_SHA256):
-            raise SecurityError("Downloaded file failed integrity check")
-
+            raise SecurityError("File integrity check failed")
+        
         logger.info("Starting server process...")
-
-        # Prepare environment for child process (minimal)
+        
         env = os.environ.copy()
-        # Pass config via environment variables instead of command line args (more secure)
         env['XPROXYCON_PORT'] = str(config['port'])
         env['XPROXYCON_API_KEY'] = config['api_key']
         env['XPROXYCON_PROXY_KEY'] = config['proxy_key']
         env['XPROXYCON_INSTANCE_ID'] = config['instance_id']
-
-        # Remove sensitive data from env if present
-        env.pop('HISTFILE', None)
-
-        # Start process securely
-        process = subprocess.Popen(
+        
+        server_process = subprocess.Popen(
             [sys.executable, target],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
-            cwd=temp_dir,
-            start_new_session=True # Detach from parent terminal
+            cwd=server_dir,
+            start_new_session=True
         )
-
-        logger.info(f"✓ Server started (PID: {process.pid})")
-
-        # Note: We don't wait for the process to finish, allowing installer to exit
-
-    except SecurityError as e:
-        logger.error(f"Security violation: {e}")
-        if os.path.exists(target):
-            os.remove(target)
-        if os.path.exists(temp_dir):
-            os.rmdir(temp_dir)
-        sys.exit(1)
+        
+        logger.info(f"✓ Server started (PID: {server_process.pid})")
+        
     except Exception as e:
         logger.error(f"Error during download/execution: {e}")
-        if os.path.exists(target):
-            os.remove(target)
-        if os.path.exists(temp_dir):
-            os.rmdir(temp_dir)
         sys.exit(1)
 
+def run_daemon():
+    """Run in daemon mode (background)"""
+    try:
+        # Load config
+        config_path = os.path.expanduser('~/.xproxycon_config.json')
+        if not os.path.exists(config_path):
+            logger.error("Configuration not found. Run installer first.")
+            sys.exit(1)
+        
+        with open(config_path, 'r') as f:
+            global config
+            config = json.load(f)
+        
+        # Start server
+        download_and_run_server(config)
+        
+        # Start auto-update daemon
+        update_thread = threading.Thread(
+            target=auto_update_daemon,
+            daemon=True,
+            name="AutoUpdateDaemon"
+        )
+        update_thread.start()
+        
+        # Keep running
+        while True:
+            time.sleep(60)
+            
+    except KeyboardInterrupt:
+        logger.info("Daemon stopped")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Daemon error: {e}")
+        sys.exit(1)
 
 def main():
     """Main installation function"""
     try:
+        # Check for daemon mode
+        if '--daemon' in sys.argv:
+            run_daemon()
+            return
+        
+        # Normal installation
         installer = XProxyConInstaller()
-
-        # 1. Validate environment
+        
         if not installer.validate_environment():
             logger.error("Environment validation failed!")
             sys.exit(1)
-
-        # 2. Collect user input
+        
         config = installer.collect_user_input()
-
-        # 3. Check port availability
+        
         if not installer.check_port(config['port']):
             logger.error("Port is not available!")
             sys.exit(1)
-
-        # 4. Save configuration securely
+        
         installer.save_configuration()
-
-        # 5. Run diagnostics
-        diagnostics = installer.run_diagnostics()
-        logger.info(f"Diagnostics completed.")
-
+        installer.run_diagnostics()
+        
         logger.info("\n✓ Installation complete!")
+        
+        # Setup autostart
+        logger.info("Setting up autostart...")
+        setup_autostart()
+        
         logger.info("Starting server in background...")
-
-        # 6. Download and run server securely
+        
+        # Save config globally
+        global config
+        config = installer.config
+        
+        # Start server
         download_and_run_server(config)
-
-        logger.info("\nDone. Check logs for server status.")
-
+        
+        # Start auto-update daemon
+        update_thread = threading.Thread(
+            target=auto_update_daemon,
+            daemon=True,
+            name="AutoUpdateDaemon"
+        )
+        update_thread.start()
+        
+        logger.info("\n✓ Setup complete! Server is running.")
+        logger.info(f"  Service: systemctl status xproxycon (if using systemd)")
+        logger.info(f"  Logs: /var/log/xproxycon/ or ./xproxycon_installer.log")
+        
+        # Keep main thread alive
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            logger.info("\nShutting down...")
+            sys.exit(0)
+        
     except KeyboardInterrupt:
-        logger.info("\nInstallation cancelled by user.")
+        logger.info("\nInstallation cancelled.")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         sys.exit(1)
 
-
 if __name__ == '__main__':
-    main()  
+    main()
