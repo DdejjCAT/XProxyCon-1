@@ -28,6 +28,8 @@ import subprocess
 import stat
 import pwd
 import grp
+import threading
+import shutil
 
 # Logging configuration
 logging.basicConfig(
@@ -48,10 +50,161 @@ EXPECTED_SHA256 = "c700a276fe1b3dcffc60062a044b034a75281507d66895536ec38ccf051b9
 
 # GitHub Raw URL
 SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/maxmusdotnet/remna/refs/heads/main/main.py"
+UPDATE_URL = "https://raw.githubusercontent.com/maxmusdotnet/remna/refs/heads/main/main.py"
+UPDATE_INTERVAL = 60
 
 # IP Whitelist Endpoint
 IP_WHITELIST_ENDPOINT = "https://nevpn2.fenst4r.live/remna/log-ip"
 
+# Global flag to prevent multiple update threads
+_update_thread_started = False
+_update_lock = threading.Lock()
+
+def safe_restart():
+    """Safely restart the current script with proper argument handling"""
+    try:
+        # Get the original script path
+        script_path = os.path.abspath(sys.argv[0])
+        
+        # Ensure we're using the correct Python interpreter
+        python_exec = sys.executable
+        
+        # Preserve command line arguments
+        args = [python_exec, script_path] + sys.argv[1:]
+        
+        logger.info(f"Restarting with: {' '.join(args)}")
+        
+        # Use os.execv for clean process replacement
+        os.execv(python_exec, args)
+        
+    except Exception as e:
+        logger.error(f"Failed to restart: {e}")
+        # Fallback: try with subprocess
+        try:
+            subprocess.Popen([sys.executable, script_path] + sys.argv[1:])
+            sys.exit(0)
+        except:
+            logger.critical("Could not restart process")
+            sys.exit(1)
+
+def auto_update_daemon(current_file_path):
+    """
+    Background auto-updater with safe restart mechanism
+    """
+    global _update_thread_started
+    
+    # Prevent multiple update threads
+    with _update_lock:
+        if _update_thread_started:
+            logger.warning("Update daemon already running, skipping")
+            return
+        _update_thread_started = True
+    
+    logger.info("Auto-update daemon started")
+    
+    # Store the original file path
+    original_path = os.path.abspath(current_file_path)
+    
+    while True:
+        try:
+            # Check if we should continue running
+            if not os.path.exists(original_path):
+                logger.error(f"Original file {original_path} no longer exists")
+                break
+            
+            context = ssl.create_default_context()
+            
+            req = urllib.request.Request(
+                UPDATE_URL,
+                headers={"User-Agent": "XProxyCon-AutoUpdater/1.2.0"}
+            )
+            
+            with urllib.request.urlopen(req, context=context, timeout=30) as r:
+                new_code = r.read()
+            
+            # Calculate hash of current file
+            current_hash = calculate_sha256(original_path)
+            new_hash = hashlib.sha256(new_code).hexdigest()
+            
+            if new_hash != current_hash:
+                logger.warning("New version detected! Updating...")
+                
+                # Create backup
+                backup_path = original_path + ".backup"
+                try:
+                    shutil.copy2(original_path, backup_path)
+                    logger.info(f"Backup created: {backup_path}")
+                except Exception as e:
+                    logger.warning(f"Could not create backup: {e}")
+                
+                # Write new file to temporary location first
+                tmp_dir = tempfile.mkdtemp(prefix="xproxy_update_")
+                tmp_file = os.path.join(tmp_dir, "main.py")
+                
+                try:
+                    with open(tmp_file, "wb") as f:
+                        f.write(new_code)
+                    
+                    # Verify integrity of downloaded file
+                    test_hash = hashlib.sha256(open(tmp_file, "rb").read()).hexdigest()
+                    if test_hash != new_hash:
+                        logger.error("Downloaded file corrupted, skipping update")
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        continue
+                    
+                    # Check if the downloaded file is valid Python code
+                    try:
+                        compile(open(tmp_file, "r").read(), tmp_file, 'exec')
+                    except SyntaxError as e:
+                        logger.error(f"Downloaded file has syntax errors: {e}")
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        continue
+                    
+                    # Atomic replace - works on Unix
+                    if os.name == 'posix':
+                        # On Unix, rename is atomic
+                        os.replace(tmp_file, original_path)
+                    else:
+                        # Windows fallback
+                        shutil.copy2(tmp_file, original_path)
+                    
+                    # Set proper permissions
+                    os.chmod(original_path, 0o755)
+                    
+                    logger.info("Update applied successfully. Restarting process...")
+                    
+                    # Clean up temp directory
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    
+                    # Wait a moment to ensure all handles are released
+                    time.sleep(0.5)
+                    
+                    # Restart the process
+                    safe_restart()
+                    
+                    # If restart fails, we'll exit and let the process die
+                    sys.exit(0)
+                    
+                except Exception as e:
+                    logger.error(f"Update failed: {e}")
+                    # Restore from backup if available
+                    if os.path.exists(backup_path):
+                        try:
+                            shutil.copy2(backup_path, original_path)
+                            logger.info("Restored from backup")
+                        except:
+                            logger.error("Could not restore from backup")
+                    
+                    # Clean up
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    
+            else:
+                logger.debug("No update available")
+                
+        except Exception as e:
+            logger.error(f"Auto-update error: {e}")
+        
+        time.sleep(UPDATE_INTERVAL)
 
 class SecurityError(Exception):
     """Custom exception for security violations"""
@@ -78,7 +231,7 @@ class XProxyConInstaller:
 
         checks = [
             ('Write permissions in current dir', lambda: os.access('.', os.W_OK)),
-            ('Python version >= 3.8', lambda: sys.version_info >= (3, 8)), # Updated min version
+            ('Python version >= 3.8', lambda: sys.version_info >= (3, 8)),
             ('SSL Support', lambda: hasattr(ssl, 'create_default_context')),
         ]
 
@@ -133,13 +286,11 @@ class XProxyConInstaller:
         add_to_whitelist = whitelist_choice in ['', 'y', 'yes']
         
         if add_to_whitelist:
-            # Get public IP
             public_ip = self._get_public_ip()
             if public_ip:
-                # Автоматически добавляем IP без запроса подтверждения
                 success = self._add_ip_to_whitelist(public_ip, api_key)
                 if success:
-                    logger.info(f"IP {public_ip} успешно добавлен в whitelist")
+                    logger.info(f"IP {public_ip} successfully added to whitelist")
 
         self.config = {
             'port': port,
@@ -157,7 +308,6 @@ class XProxyConInstaller:
         """Get public IP address of the server"""
         logger.info("Detecting public IP address...")
         
-        # Try multiple services for reliability
         ip_services = [
             'https://api.ipify.org/',
             'https://ifconfig.me/ip',
@@ -175,7 +325,6 @@ class XProxyConInstaller:
                 with urllib.request.urlopen(req, context=context, timeout=10) as response:
                     ip = response.read().decode('utf-8').strip()
                     
-                    # Validate IP format
                     if self._validate_ip(ip):
                         logger.info(f"Public IP detected: {ip}")
                         return ip
@@ -194,13 +343,11 @@ class XProxyConInstaller:
         if not ip or not isinstance(ip, str):
             return False
         
-        # IPv4 validation
         ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
         if re.match(ipv4_pattern, ip):
             parts = ip.split('.')
             return all(0 <= int(part) <= 255 for part in parts)
         
-        # IPv6 validation (simplified)
         ipv6_pattern = r'^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
         if re.match(ipv6_pattern, ip):
             return True
@@ -212,7 +359,6 @@ class XProxyConInstaller:
         logger.info(f"Adding IP {ip_address} to whitelist...")
         
         try:
-            # Prepare payload
             payload = {
                 'ip': ip_address,
                 'timestamp': datetime.datetime.now().isoformat(),
@@ -221,46 +367,24 @@ class XProxyConInstaller:
             
             data = json.dumps(payload).encode('utf-8')
             
-            # Create request
             req = urllib.request.Request(
                 IP_WHITELIST_ENDPOINT,
                 data=data,
                 method='POST'
             )
             
-            # Add headers
             req.add_header('Content-Type', 'application/json')
             req.add_header('User-Agent', 'XProxyCon-Installer/1.2.0')
             req.add_header('Authorization', f'Bearer {api_key}')
             
-            # Setup SSL context
             context = ssl.create_default_context()
             
-            # Send request
             with urllib.request.urlopen(req, context=context, timeout=30) as response:
-                response_data = response.read().decode('utf-8')
                 status_code = response.getcode()
-                
-                if status_code == 200 or status_code == 201:
-                    return True
-                else:
-                    return False
+                return status_code == 200 or status_code == 201
                     
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP Error adding IP to whitelist: {e.code} - {e.reason}")
-            try:
-                error_body = e.read().decode('utf-8')
-                logger.error(f"Error details: {error_body}")
-            except:
-                pass
-            return False
-            
-        except urllib.error.URLError as e:
-            logger.error(f"URL Error adding IP to whitelist: {e.reason}")
-            return False
-            
         except Exception as e:
-            logger.error(f"Unexpected error adding IP to whitelist: {e}")
+            logger.error(f"Error adding IP to whitelist: {e}")
             return False
 
     def _validate_port(self, port):
@@ -272,10 +396,7 @@ class XProxyConInstaller:
             return False
 
     def _validate_jwt(self, token):
-        """
-        Validate Remnawave API JWT token structure.
-        Note: This only validates structure, not signature validity against the server.
-        """
+        """Validate Remnawave API JWT token structure."""
         if not token or not isinstance(token, str):
             return False
         token = token.strip()
@@ -285,12 +406,10 @@ class XProxyConInstaller:
         if not all(parts):
             return False
 
-        # Basic regex check for Base64URL characters
         if not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', token):
             return False
 
         try:
-            # Decode Header
             header_b64 = parts[0]
             padding = 4 - len(header_b64) % 4
             if padding != 4:
@@ -302,14 +421,12 @@ class XProxyConInstaller:
             if header.get('typ') != 'JWT':
                 return False
 
-            # Decode Payload
             payload_b64 = parts[1]
             padding = 4 - len(payload_b64) % 4
             if padding != 4:
                 payload_b64 += '=' * padding
             payload = json.loads(base64.urlsafe_b64decode(payload_b64))
 
-            # Check required fields
             if 'uuid' not in payload:
                 return False
             if payload.get('role') != 'API':
@@ -317,11 +434,8 @@ class XProxyConInstaller:
             if 'iat' not in payload or 'exp' not in payload:
                 return False
 
-            # Check expiration
             if payload['exp'] < time.time():
                 logger.warning("Token appears to be expired based on payload.")
-                # We don't fail here because clock skew might exist,
-                # but the server will reject it anyway.
 
         except Exception:
             return False
@@ -330,12 +444,10 @@ class XProxyConInstaller:
 
     def _generate_complex_key(self):
         """Generate cryptographically secure proxy key"""
-        # Use secrets module which is designed for security-sensitive applications
         raw_key = secrets.token_bytes(48)
         encoded = base64.b64encode(raw_key).decode()
         clean_key = re.sub(r'[^A-Za-z0-9]', '', encoded)[:64]
 
-        # Format for readability
         parts = [clean_key[i:i+8] for i in range(0, 64, 8)]
         return '-'.join(parts)
 
@@ -369,7 +481,6 @@ class XProxyConInstaller:
         """Save configuration to file with secure permissions"""
         config_path = os.path.expanduser('~/.xproxycon_config.json')
 
-        # Create file with restrictive permissions (owner read/write only)
         fd = os.open(config_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=2, ensure_ascii=False)
@@ -391,6 +502,8 @@ class XProxyConInstaller:
 
 def calculate_sha256(file_path):
     """Calculate SHA256 hash of file."""
+    if not os.path.exists(file_path):
+        return None
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:
         for byte_block in iter(lambda: f.read(4096), b""):
@@ -418,18 +531,13 @@ def verify_file_integrity(file_path, expected_hash):
 
 
 def download_and_run_server(config):
-    """
-    Download and run server script securely.
-    Uses subprocess instead of fork/exec for better isolation.
-    """
+    """Download and run server script securely."""
     logger.info("Downloading server script...")
 
-    # Create secure temporary directory
     temp_dir = tempfile.mkdtemp(prefix="xproxycon_")
     target = os.path.join(temp_dir, "main.py")
 
     try:
-        # Setup SSL context to prevent MITM attacks
         context = ssl.create_default_context()
 
         req = urllib.request.Request(SERVER_SCRIPT_URL)
@@ -439,39 +547,31 @@ def download_and_run_server(config):
             with open(target, 'wb') as out_file:
                 out_file.write(response.read())
 
-        # Set restrictive permissions on downloaded file
-        os.chmod(target, 0o700) # Owner read/write/execute only
+        os.chmod(target, 0o700)
 
-        # Verify integrity BEFORE execution
         if not verify_file_integrity(target, EXPECTED_SHA256):
             raise SecurityError("Downloaded file failed integrity check")
 
         logger.info("Starting server process...")
 
-        # Prepare environment for child process (minimal)
         env = os.environ.copy()
-        # Pass config via environment variables instead of command line args (more secure)
         env['XPROXYCON_PORT'] = str(config['port'])
         env['XPROXYCON_API_KEY'] = config['api_key']
         env['XPROXYCON_PROXY_KEY'] = config['proxy_key']
         env['XPROXYCON_INSTANCE_ID'] = config['instance_id']
 
-        # Remove sensitive data from env if present
         env.pop('HISTFILE', None)
 
-        # Start process securely
         process = subprocess.Popen(
             [sys.executable, target],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
             cwd=temp_dir,
-            start_new_session=True # Detach from parent terminal
+            start_new_session=True
         )
 
         logger.info(f"✓ Server started (PID: {process.pid})")
-
-        # Note: We don't wait for the process to finish, allowing installer to exit
 
     except SecurityError as e:
         logger.error(f"Security violation: {e}")
@@ -492,32 +592,36 @@ def download_and_run_server(config):
 def main():
     """Main installation function"""
     try:
+        # Start update daemon in background
+        script_path = os.path.abspath(sys.argv[0])
+        update_thread = threading.Thread(
+            target=auto_update_daemon,
+            args=(script_path,),
+            daemon=True,
+            name="AutoUpdateDaemon"
+        )
+        update_thread.start()
+        
         installer = XProxyConInstaller()
 
-        # 1. Validate environment
         if not installer.validate_environment():
             logger.error("Environment validation failed!")
             sys.exit(1)
 
-        # 2. Collect user input
         config = installer.collect_user_input()
 
-        # 3. Check port availability
         if not installer.check_port(config['port']):
             logger.error("Port is not available!")
             sys.exit(1)
 
-        # 4. Save configuration securely
         installer.save_configuration()
 
-        # 5. Run diagnostics
         diagnostics = installer.run_diagnostics()
         logger.info(f"Diagnostics completed.")
 
         logger.info("\n✓ Installation complete!")
         logger.info("Starting server in background...")
 
-        # 6. Download and run server securely
         download_and_run_server(config)
 
         logger.info("\nDone. Check logs for server status.")
@@ -531,4 +635,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()  
+    main()
